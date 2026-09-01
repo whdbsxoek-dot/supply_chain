@@ -1,0 +1,23 @@
+# 원료 재고 소진 예측 & 발주 알림 앱 (Streamlit)
+#   설치:  pip install -r requirements.txt
+#   실행:  streamlit run app.py
+
+# --- 앱 프레임워크 ---
+streamlit>=1.32,<2.0
+
+# --- 데이터 / 차트 ---
+pandas>=2.0,<3.0
+altair>=5.0,<6.0          # streamlit이 함께 설치하지만 직접 쓰므로 명시
+numpy>=1.26,<3.0
+
+# --- 엑셀 내보내기 ---
+openpyxl>=3.1,<4.0
+
+# --- RAG (AI 어시스턴트) ---
+openai>=1.70,<2.0
+faiss-cpu>=1.8,<2.0
+python-dotenv>=1.0,<2.0
+
+# --- 선택: 토큰 수를 정확히 세고 싶을 때 ---
+# 없으면 문자 수 기반 휴리스틱으로 넘어간다(과대평가 쪽이라 상한은 항상 지켜진다).
+tiktoken>=0.7,<1.0
