@@ -1,20 +1,25 @@
 # 원료 재고 소진 예측 & 발주 알림 앱 (Streamlit)
 #   설치:  pip install -r requirements.txt
 #   실행:  streamlit run app.py
+#
+# 상한은 메이저 하나 위까지만 막아 둔다. 실제로 아래 조합에서 동작을 확인했다:
+#   Python 3.14.6 / streamlit 1.58 / pandas 3.0.3 / altair 6.0 / numpy 2.4.6
+#   openpyxl 3.1.5 / openai 3.6.0 / faiss-cpu 1.15 / tiktoken 0.14
 
 # --- 앱 프레임워크 ---
-streamlit>=1.32,<2.0
+# width="stretch" 를 쓰므로 1.49 이상이 필요하다 (그 이전은 use_container_width).
+streamlit>=1.49,<2.0
 
 # --- 데이터 / 차트 ---
-pandas>=2.0,<3.0
-altair>=5.0,<6.0          # streamlit이 함께 설치하지만 직접 쓰므로 명시
+pandas>=2.0,<4.0
+altair>=5.0,<7.0          # streamlit이 함께 설치하지만 직접 쓰므로 명시
 numpy>=1.26,<3.0
 
 # --- 엑셀 내보내기 ---
 openpyxl>=3.1,<4.0
 
 # --- RAG (AI 어시스턴트) ---
-openai>=1.70,<2.0
+openai>=1.70,<4.0
 faiss-cpu>=1.8,<2.0
 python-dotenv>=1.0,<2.0
 

@@ -370,6 +370,12 @@ def schedules_for(material_id: str, all_schedules: list[IncomingSchedule] | None
 SIMULATION_LIMIT_DAYS = 365
 DEFAULT_PROJECTION_DAYS = 60
 
+# 차트 창을 자동으로 정할 때의 하한/상한.
+# 하한이 없으면 오늘 소진되는 원료의 그래프가 점 두 개짜리가 되고,
+# 상한이 없으면 재고가 아주 많은 원료에서 365일짜리 평평한 선이 나온다.
+MIN_PROJECTION_DAYS = 14
+MAX_PROJECTION_DAYS = 180
+
 
 def build_incoming_by_date(items: list[IncomingSchedule]) -> dict[str, float]:
     """
@@ -514,6 +520,51 @@ def project_stock(
         points.append({"date": current, "stock": stock, "incoming": incoming})
 
     return points
+
+
+def choose_projection_days(
+    material: Material,
+    items: list[IncomingSchedule],
+    status: MaterialStatus,
+    today: str,
+) -> int:
+    """
+    차트에 보여줄 기간을 데이터에 맞춰 고른다.
+
+    60일 고정으로 두면 8일 만에 소진되는 원료는 그래프의 85%가 바닥에 붙은
+    평평한 선이 되어 정작 봐야 할 하강 구간이 뭉개진다.
+
+    창에 반드시 들어가야 하는 것:
+      - 소진 예정일 (가장 중요한 지점)
+      - 발주 필요일
+      - 앞으로 들어올 입고 예정일 — 소진 **이후**에 도착하는 입고도 포함해야
+        "이 납기는 이미 늦다"가 눈에 보인다.
+    거기에 여백을 조금 더해 마커가 오른쪽 끝에 붙지 않게 한다.
+    """
+    milestones: list[int] = []
+
+    if status.days_until_depletion is not None:
+        milestones.append(status.days_until_depletion)
+    if status.days_until_reorder is not None:
+        milestones.append(status.days_until_reorder)
+
+    for item in items:
+        if item.status != "scheduled":
+            continue
+        offset = diff_days(today, item.expected_date)
+        if 0 < offset <= MAX_PROJECTION_DAYS:
+            milestones.append(offset)
+
+    if not milestones:
+        # 소진도 발주도 1년 내에 없고 입고 예정도 없는 원료. 기본 창으로 둔다.
+        return DEFAULT_PROJECTION_DAYS
+
+    span = max(milestones)
+    # 여백은 span의 1/4, 최소 7일. 정수 나눗셈을 쓰는 이유는 React 판(src/)과 값을
+    # 정확히 맞추기 위해서다 — JS Math.round(2.5)=3, Python round(2.5)=2 라서
+    # 반올림을 쓰면 두 구현의 창 길이가 하루씩 어긋난다.
+    padded = span + max(7, span // 4)
+    return max(MIN_PROJECTION_DAYS, min(MAX_PROJECTION_DAYS, padded))
 
 
 def incoming_quantity_in_range(
@@ -1505,12 +1556,18 @@ NO_CONTEXT_ANSWER = (
 )
 
 
+# temperature를 거부하는 모델을 기억해 둔다.
+# gpt-5.6-sol은 temperature=0에 400을 돌려준다. 이 사실을 기억하지 않으면
+# 질문할 때마다 실패 왕복이 한 번씩 더 붙는다(실제로 매 호출 400 → 재시도였다).
+_models_without_temperature: set[str] = set()
+
+
 def generate_answer(messages: list[dict[str, str]]) -> tuple[str, int, int]:
     """
     :returns: (답변, 프롬프트 토큰, 완성 토큰)
 
     temperature를 고정값으로 보내면 일부 신형 모델이 400을 돌려준다.
-    그래서 실패하면 파라미터를 빼고 한 번 더 시도한다.
+    그래서 실패하면 파라미터를 빼고 한 번 더 시도하고, 그 결과를 기억한다.
     """
     api_key = get_api_key()
     if not api_key:
@@ -1525,12 +1582,15 @@ def generate_answer(messages: list[dict[str, str]]) -> tuple[str, int, int]:
             kwargs["temperature"] = 0
         return client.chat.completions.create(**kwargs)
 
+    supports_temperature = model not in _models_without_temperature
+
     try:
         try:
-            response = call(True)
+            response = call(supports_temperature)
         except Exception as error:  # noqa: BLE001
-            if "temperature" in str(error).lower():
-                logger.info("temperature 미지원 모델로 판단, 기본값으로 재시도합니다.")
+            if supports_temperature and "temperature" in str(error).lower():
+                logger.info("%s 는 temperature를 지원하지 않습니다. 기본값으로 재시도합니다.", model)
+                _models_without_temperature.add(model)
                 response = call(False)
             else:
                 raise
@@ -1638,9 +1698,15 @@ def dday_text(target: str | None, today: str, empty: str = "-") -> str:
     return f"{target} ({format_dday(target, today)})"
 
 
-def stock_chart(material: Material, own_schedules: list[IncomingSchedule], status: MaterialStatus, today: str):
+def stock_chart(
+    material: Material,
+    own_schedules: list[IncomingSchedule],
+    status: MaterialStatus,
+    today: str,
+    days: int,
+):
     """재고 추이 예측 — 라인 + 안전재고 기준선 + 소진일 마커 + 입고 지점."""
-    points = project_stock(material, own_schedules, today, DEFAULT_PROJECTION_DAYS)
+    points = project_stock(material, own_schedules, today, days)
     frame = pd.DataFrame(points)
     frame["date"] = pd.to_datetime(frame["date"])
 
@@ -1682,21 +1748,33 @@ def stock_chart(material: Material, own_schedules: list[IncomingSchedule], statu
             )
         )
 
-    if status.depletion_date and status.days_until_depletion is not None:
-        if status.days_until_depletion <= DEFAULT_PROJECTION_DAYS:
-            layers.append(
-                alt.Chart(pd.DataFrame({"x": [pd.to_datetime(status.depletion_date)]}))
-                .mark_rule(color=COLOR_DEPLETION, strokeDash=[3, 3], strokeWidth=1.5)
-                .encode(x="x:T")
-            )
+    # 창 밖의 소진일에 마커를 그리면 축이 그쪽까지 늘어나 창을 좁힌 의미가 없어진다.
+    depletion_in_window = (
+        status.days_until_depletion is not None and status.days_until_depletion <= days
+    )
+    if status.depletion_date and depletion_in_window:
+        layers.append(
+            alt.Chart(pd.DataFrame({"x": [pd.to_datetime(status.depletion_date)]}))
+            .mark_rule(color=COLOR_DEPLETION, strokeDash=[3, 3], strokeWidth=1.5)
+            .encode(x="x:T")
+        )
 
-    st.altair_chart(alt.layer(*layers).properties(height=280), use_container_width=True)
+    st.altair_chart(alt.layer(*layers).properties(height=280), width="stretch")
 
-    caption = ["🔵 예상 재고", f"🟠 안전재고 {fmt_num(material.safety_stock)}{material.unit}"]
+    caption = [
+        f"오늘 ~ {points[-1]['date']} ({days}일)",
+        "🔵 예상 재고",
+        f"🟠 안전재고 {fmt_num(material.safety_stock)}{material.unit}",
+    ]
     if not incoming_points.empty:
         caption.append("🟢 입고 예정")
     if status.depletion_date:
-        caption.append(f"🔴 소진 {status.depletion_date}")
+        # 창 밖이면 마커가 없으므로 그 사실을 글로 알려준다.
+        caption.append(
+            f"🔴 소진 {status.depletion_date}"
+            if depletion_in_window
+            else f"소진 {status.depletion_date} (창 밖)"
+        )
     st.caption(" · ".join(caption))
 
 
@@ -1768,7 +1846,7 @@ def page_dashboard(today: str) -> None:
                     for material, status in alert_rows
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         st.caption("원료를 자세히 보려면 왼쪽 메뉴의 **원료 관리**에서 선택하세요.")
@@ -1806,7 +1884,7 @@ def page_dashboard(today: str) -> None:
                     for s in upcoming
                 ]
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -1892,7 +1970,7 @@ def render_material_list(today: str) -> None:
                 for material, status in visible
             ]
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -1904,7 +1982,7 @@ def render_material_list(today: str) -> None:
         format_func=lambda mid: next(m.name for m, _ in visible if m.id == mid),
     )
     c2.write("")
-    if c2.button("상세 보기 →", type="primary", use_container_width=True):
+    if c2.button("상세 보기 →", type="primary", width="stretch"):
         st.session_state.selected_material_id = choice
         st.rerun()
 
@@ -2030,7 +2108,7 @@ def render_material_detail(material_id: str, today: str) -> None:
     c1, c2 = st.columns([4, 1])
     c1.title(f"{material.name} {status_chip(status.alert_status)}")
     c2.write("")
-    if c2.button("← 목록으로", use_container_width=True):
+    if c2.button("← 목록으로", width="stretch"):
         st.session_state.selected_material_id = None
         st.rerun()
 
@@ -2067,8 +2145,26 @@ def render_material_detail(material_id: str, today: str) -> None:
             f"발주 필요일이 {status.days_until_reorder}일 남았습니다. 발주 준비를 시작하세요."
         )
 
-    st.subheader("재고 추이 예측")
-    stock_chart(material, own_schedules, status, today)
+    # 기본은 데이터에 맞춘 자동 창. 더 멀리 보고 싶으면 직접 고를 수 있게 해 둔다.
+    auto_days = choose_projection_days(material, own_schedules, status, today)
+    RANGE_OPTIONS: dict[str, int | None] = {
+        f"자동 ({auto_days}일)": None,
+        "30일": 30,
+        "60일": 60,
+        "90일": 90,
+        "180일": 180,
+    }
+
+    c1, c2 = st.columns([3, 1])
+    c1.subheader("재고 추이 예측")
+    choice = c2.selectbox(
+        "표시 기간",
+        list(RANGE_OPTIONS.keys()),
+        # 원료마다 자동값이 다르므로 키에 id를 넣어 위젯이 섞이지 않게 한다.
+        key=f"range_{material.id}",
+        label_visibility="collapsed",
+    )
+    stock_chart(material, own_schedules, status, today, RANGE_OPTIONS[choice] or auto_days)
 
     tab_info, tab_schedule, tab_history = st.tabs(["기본 정보", "입고 예정", "재고 변동 이력"])
 
@@ -2198,7 +2294,7 @@ def render_material_detail(material_id: str, today: str) -> None:
                         for log in material_logs
                     ]
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2218,7 +2314,7 @@ def page_report(today: str) -> None:
         st.session_state.week_start = start_of_week(today)
 
     c1, c2, c3, c4 = st.columns([1, 2, 1, 1])
-    if c1.button("‹ 이전 주", use_container_width=True):
+    if c1.button("‹ 이전 주", width="stretch"):
         st.session_state.week_start = add_days(st.session_state.week_start, -7)
         st.rerun()
 
@@ -2233,10 +2329,10 @@ def page_report(today: str) -> None:
         st.session_state.week_start = normalized
         st.rerun()
 
-    if c3.button("다음 주 ›", use_container_width=True):
+    if c3.button("다음 주 ›", width="stretch"):
         st.session_state.week_start = add_days(st.session_state.week_start, 7)
         st.rerun()
-    if c4.button("이번 주", use_container_width=True):
+    if c4.button("이번 주", width="stretch"):
         st.session_state.week_start = start_of_week(today)
         st.rerun()
 
@@ -2268,7 +2364,7 @@ def page_report(today: str) -> None:
 
     st.dataframe(
         pd.DataFrame([row.cells for row in rows], columns=REPORT_HEADERS),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -2283,7 +2379,7 @@ def page_report(today: str) -> None:
             file_name=f"원료수급리포트_{week_start}_{week_end}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
     with c2:
         st.download_button(
@@ -2292,7 +2388,7 @@ def page_report(today: str) -> None:
             data=("﻿" + rows_to_csv(rows)).encode("utf-8"),
             file_name=f"원료수급리포트_{week_start}_{week_end}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     with st.expander("📋 표 복사 (TSV — 엑셀·메일에 그대로 붙여넣기)"):
@@ -2359,7 +2455,7 @@ def page_assistant(today: str) -> None:
 
     c1, c2 = st.columns([3, 1])
     c1.caption(f"모델 `{get_chat_model()}` · 임베딩 `{get_embedding_model()}`")
-    if c2.button("🔄 인덱스 재생성", use_container_width=True):
+    if c2.button("🔄 인덱스 재생성", width="stretch"):
         try:
             ensure_index(today, force=True)
             total, embedded, reused = st.session_state.get("last_index_stats", (0, 0, 0))
@@ -2379,7 +2475,7 @@ def page_assistant(today: str) -> None:
         )
         cols = st.columns(2)
         for i, suggestion in enumerate(SUGGESTIONS):
-            if cols[i % 2].button(suggestion, key=f"suggest_{i}", use_container_width=True):
+            if cols[i % 2].button(suggestion, key=f"suggest_{i}", width="stretch"):
                 st.session_state.pending_question = suggestion
                 st.rerun()
 
@@ -2491,10 +2587,10 @@ def main() -> None:
                 data=json.dumps(get_store(), ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name=f"재고백업_{today}.json",
                 mime="application/json",
-                use_container_width=True,
+                width="stretch",
             )
             uploaded = st.file_uploader("백업 복원", type="json", label_visibility="collapsed")
-            if uploaded is not None and st.button("복원 실행", use_container_width=True):
+            if uploaded is not None and st.button("복원 실행", width="stretch"):
                 try:
                     restored = json.loads(uploaded.getvalue().decode("utf-8"))
                     commit(
